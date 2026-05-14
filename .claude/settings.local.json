@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"C:/workshop/projects/modsharp/Engine/\")",
+      "Read(//c/workshop/projects/modsharp/Engine/**)",
+      "Bash(ls -la \"C:/workshop/projects/modsharp/Loader/\")",
+      "Read(//c/workshop/projects/modsharp/Loader/**)",
+      "Bash(ls -la \"C:/workshop/projects/modsharp/Sharp.Core/\")",
+      "Read(//c/workshop/projects/modsharp/Sharp.Core/**)",
+      "Bash(ls -la \"C:/workshop/projects/modsharp/Sharp.Shared/\")",
+      "Read(//c/workshop/projects/modsharp/Sharp.Shared/**)",
+      "Bash(ls -la \"C:/workshop/projects/modsharp/Sharp.Generator/\")",
+      "Read(//c/workshop/projects/modsharp/Sharp.Generator/**)",
+      "Bash(ls -la \"C:/workshop/projects/modsharp/proto/\")",
+      "Read(//c/workshop/projects/modsharp/proto/**)",
+      "Read(//c/workshop/projects/modsharp/**)",
+      "Bash(git submodule *)",
+      "Bash(ls -la \"game-overlay/sln/\")",
+      "Read(//c/workshop/projects/modsharp-public/**)"
+    ]
+  }
+}
