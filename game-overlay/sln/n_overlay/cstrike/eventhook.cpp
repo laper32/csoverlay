@@ -14,6 +14,44 @@
 #include "cstrike/interface/IMemAlloc.h"
 
 #include <windows.h>
+
+// Minimal x64 inline hook — no external dependencies
+static uint8_t  g_OrigBytes[14];
+static uint8_t* g_HookTarget    = nullptr;
+static uint8_t* g_Trampoline    = nullptr;  // callable original
+
+static void InstallHook(void* target, void* detour)
+{
+    g_HookTarget = (uint8_t*)target;
+    memcpy(g_OrigBytes, target, 14);
+
+    // Allocate trampoline: orig bytes + jmp back to target+14
+    g_Trampoline = (uint8_t*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    memcpy(g_Trampoline, g_OrigBytes, 14);
+    // jmp [rip] — jmp back to original + 14
+    uint8_t* jmpBack = g_HookTarget + 14;
+    g_Trampoline[14] = 0xFF; g_Trampoline[15] = 0x25; g_Trampoline[16] = 0x00; g_Trampoline[17] = 0x00; g_Trampoline[18] = 0x00; g_Trampoline[19] = 0x00;
+    memcpy(g_Trampoline + 20, &jmpBack, 8);
+
+    // Patch target: mov rax, imm64; jmp rax -> detour
+    DWORD old;
+    VirtualProtect(target, 14, PAGE_EXECUTE_READWRITE, &old);
+    uint8_t tramp[] = { 0x48, 0xB8, 0,0,0,0,0,0,0,0, 0xFF, 0xE0 };
+    memcpy(tramp + 2, &detour, 8);
+    memcpy(target, tramp, 12);
+    VirtualProtect(target, 14, old, &old);
+}
+
+static void RemoveHook()
+{
+    if (!g_HookTarget) return;
+    DWORD old;
+    VirtualProtect(g_HookTarget, 14, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(g_HookTarget, g_OrigBytes, 14);
+    VirtualProtect(g_HookTarget, 14, old, &old);
+    if (g_Trampoline) { VirtualFree(g_Trampoline, 0, MEM_RELEASE); g_Trampoline = nullptr; }
+    g_HookTarget = nullptr;
+}
 #include <tlhelp32.h>
 #include <string>
 #include <cstdio>
@@ -47,45 +85,28 @@ static void allocConsole()
     }
 }
 
-IGameEventManager2* g_pEventManager = nullptr;
-GameEventCallback   g_onGameEvent   = nullptr;
-
+GameEventCallback g_onGameEvent   = nullptr;
 static const char* g_StatusMsg = "not initialized";
 
-const char* getEventHookStatus()
-{
-    return g_StatusMsg;
-}
+const char* getEventHookStatus() { return g_StatusMsg; }
 
-class CGameEventListener : public IGameEventListener2
+// ---- Signature-scan + detour the client-side event dispatcher ----
+
+using EventDispatchFn = void (*)(void* a1, IGameEvent* a2);
+static EventDispatchFn g_OriginalDispatch = nullptr;
+
+static void HookEventDispatch(void* a1, IGameEvent* event)
 {
-public:
-    void FireGameEvent(IGameEvent* event) override
-    {
-        if (!event) return;
+    dbgPrint("[n_overlay] EventDispatch called: a1=0x%p event=0x%p\n", a1, (void*)event);
+
+    if (event) {
         const char* name = event->GetName();
-        if (!name) return;
-
-        dbgPrint("[n_overlay] FireGameEvent: %s\n", name);
-
-        if (strcmp(name, "round_mvp") != 0) return;
-
-        int userid = 0, reason = 0;
-        GameEventKeySymbol_t keyUserid("userid");
-        GameEventKeySymbol_t keyReason("reason");
-        if (event->HasKey(keyUserid)) userid = event->GetInt(keyUserid);
-        if (event->HasKey(keyReason)) reason = event->GetInt(keyReason);
-
-        char buf[128];
-        snprintf(buf, sizeof(buf), "{\"userid\":%d,\"reason\":%d}", userid, reason);
-        dbgPrint("[n_overlay] round_mvp! %s\n", buf);
-
-        if (g_onGameEvent) g_onGameEvent("round_mvp", buf);
+        dbgPrint("[n_overlay]   event name: %s\n", name ? name : "(null)");
     }
 
-    int GetEventDebugID(void) override { return 42; }
-} g_EventListener;
-
+    // Call original via trampoline
+    ((EventDispatchFn)g_Trampoline)(a1, event);
+}
 
 static void dumpLoadedModules()
 {
@@ -113,68 +134,44 @@ bool initEventHook()
         auto* ppMemAlloc = (IMemAlloc**)GetProcAddress(tier0, "g_pMemAlloc");
         if (!ppMemAlloc) { g_StatusMsg = "g_pMemAlloc not found"; return false; }
         g_pMemAlloc = *ppMemAlloc;
+        dbgPrint("[n_overlay] g_pMemAlloc=0x%p\n", (void*)g_pMemAlloc);
     }
 
-    dbgPrint("[n_overlay] g_pMemAlloc=0x%p\n", (void*)g_pMemAlloc);
-    dbgPrint("[n_overlay] Loading client.dll");
-    auto client = LoadLibraryW(L"client.dll");
-    if (!client) {
-        g_StatusMsg = "client.dll failed to load";
-        dbgPrint("[n_overlay] client.dll failed to load\n");
-        return false;
+    // 2. Load client.dll & scan for event dispatch function
+    {
+        LoadLibraryW(L"client.dll");
+        HMODULE hClient = GetModuleHandleA("client.dll");
+        if (!hClient) { g_StatusMsg = "client.dll not loaded"; return false; }
+
+        auto* mod = new CModule("client.dll");
+        dbgPrint("[n_overlay] client.dll base=0x%p\n", (void*)mod->Base());
+
+        // Signature: 40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ? ? ? ? 48 81 EC ? ? ? ? 48 8B 41
+        auto addr = mod->FindPattern(
+            "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ? ? ? ? 48 81 EC ? ? ? ? 48 8B 41");
+        if (!addr.IsValid()) {
+            g_StatusMsg = "event dispatch pattern not found in client.dll";
+            dbgPrint("[n_overlay] Pattern not found\n");
+            delete mod;
+            return false;
+        }
+
+        g_OriginalDispatch = (EventDispatchFn)addr.GetPtr();
+        dbgPrint("[n_overlay] EventDispatch=0x%p\n", (void*)g_OriginalDispatch);
     }
 
-    auto* mod = new CModule("client.dll");
-    if (!mod) {
-        g_StatusMsg = "CModule init failed";
-        dbgPrint("[n_overlay] CModule init failed\n");
-        return false;
-    }
+    // 3. Install inline hook
+    InstallHook((void*)g_OriginalDispatch, (void*)HookEventDispatch);
+    dbgPrint("[n_overlay] Hook installed\n");
 
-    dbgPrint("[n_overlay] client.dll base=0x%p\n", (void*)mod->Base());
-
-    auto gameEventManagerVTable = mod->GetVirtualTableByName("CGameEventManager");
-    if (!gameEventManagerVTable) {
-        g_StatusMsg = "CGameEventManager vtable not found";
-        dbgPrint("[n_overlay] CGameEventManager vtable not found\n");
-        delete mod;
-        return false;
-    }
-
-    g_pEventManager = mod->FindPtr(gameEventManagerVTable).As<IGameEventManager2*>();
-    if (!g_pEventManager) {
-        g_StatusMsg = "IGameEventManager2 instance not found";
-        dbgPrint("[n_overlay] IGameEventManager2 instance not found\n");
-        delete mod;
-        return false;
-    }
-
-    dbgPrint("[n_overlay] CGameEventManager=0x%p\n", (void*)g_pEventManager);
-
-    auto found = g_pEventManager->FindListener(&g_EventListener, "round_mvp");
-    if (found) {
-        g_StatusMsg = "Listener already registered?";
-        dbgPrint("[n_overlay] Listener already registered?\n");
-        delete mod;
-        return false;
-    }
-
-    int eventId = g_pEventManager->AddListener(&g_EventListener, "round_start", false);
-    if (eventId == -1) {
-        g_StatusMsg = "AddListener failed: invalid event name?";
-        dbgPrint("[n_overlay] AddListener failed: round_start is invalid?\n");
-        delete mod;
-        return false;
-    }
-
+    g_StatusMsg = "ok";
+    dbgPrint("[n_overlay] SUCCESS\n");
     return true;
 }
 
 void shutdownEventHook()
 {
-    if (g_pEventManager) {
-        g_pEventManager->RemoveListener(&g_EventListener);
-        g_pEventManager = nullptr;
-    }
+    RemoveHook();
+    g_OriginalDispatch = nullptr;
     g_onGameEvent = nullptr;
 }
